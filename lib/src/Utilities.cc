@@ -26,13 +26,19 @@
 #include <io.h>
 #include <iomanip>
 #else
+#if USE_BOOST_UUID
+#include <boost/uuid/uuid.hpp>
+#include <boost/uuid/uuid_generators.hpp>
+#else
 #include <uuid.h>
+#endif
 #include <unistd.h>
 #endif
 #include <zlib.h>
 #include <sstream>
 #include <string>
 #include <mutex>
+#include <random>
 #include <algorithm>
 #include <array>
 #include <locale>
@@ -154,36 +160,39 @@ bool isInteger(std::string_view str)
 
 bool isBase64(std::string_view str)
 {
-    for (auto c : str)
-        if (!isBase64(c))
+    if (str.empty())
+        return false;
+
+    size_t padding = 0;
+    if (str.back() == '=')
+        padding++;
+    if (str.size() > 1 && str[str.size() - 2] == '=')
+        padding++;
+
+    for (size_t i = 0; i < str.size() - padding; ++i)
+    {
+        if (!isBase64(str[i]))
             return false;
+    }
+
+    if (padding > 0 && (str.size() % 4 != 0))
+        return false;
+
     return true;
 }
 
 std::string genRandomString(int length)
 {
-    static const char char_space[] =
+    static const std::string_view char_space =
         "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
-    static std::once_flag once;
-    static const size_t len = strlen(char_space);
-    static const int randMax = RAND_MAX - (RAND_MAX % len);
-    std::call_once(once, []() {
-        std::srand(static_cast<unsigned int>(time(nullptr)));
-    });
+    std::uniform_int_distribution<size_t> dist(0, char_space.size() - 1);
+    thread_local std::mt19937 rng(std::random_device{}());
 
-    int i;
     std::string str;
     str.resize(length);
-
-    for (i = 0; i < length; ++i)
+    for (char &ch : str)
     {
-        int x = std::rand();
-        while (x >= randMax)
-        {
-            x = std::rand();
-        }
-        x = (x % len);
-        str[i] = char_space[x];
+        ch = char_space[dist(rng)];
     }
 
     return str;
@@ -384,7 +393,13 @@ inline std::string createUuidString(const char *str, size_t len, bool lowercase)
 
 std::string getUuid(bool lowercase)
 {
-#if USE_OSSP_UUID
+#if USE_BOOST_UUID
+    static thread_local boost::uuids::random_generator generator;
+    boost::uuids::uuid uuid = generator();
+    char bytes[16];
+    std::copy(uuid.begin(), uuid.end(), bytes);
+    return createUuidString(bytes, 16, lowercase);
+#elif USE_OSSP_UUID
     uuid_t *uuid;
     uuid_create(&uuid);
     uuid_make(uuid, UUID_MAKE_V4);
@@ -1029,19 +1044,76 @@ std::string gzipDecompress(const char *data, const size_t ndata)
     }
 }
 
+static int formatHttpDate(char *buf, size_t len, const trantor::Date &date)
+{
+    static const char *const weekdays[] = {
+        "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
+    static const char *const months[] = {"Jan",
+                                         "Feb",
+                                         "Mar",
+                                         "Apr",
+                                         "May",
+                                         "Jun",
+                                         "Jul",
+                                         "Aug",
+                                         "Sep",
+                                         "Oct",
+                                         "Nov",
+                                         "Dec"};
+    struct tm tm = date.tmStruct();
+    return snprintf(buf,
+                    len,
+                    "%s, %02d %s %04d %02d:%02d:%02d GMT",
+                    weekdays[tm.tm_wday],
+                    tm.tm_mday,
+                    months[tm.tm_mon],
+                    tm.tm_year + 1900,
+                    tm.tm_hour,
+                    tm.tm_min,
+                    tm.tm_sec);
+}
+
 char *getHttpFullDate(const trantor::Date &date)
 {
     static thread_local int64_t lastSecond = 0;
     static thread_local char lastTimeString[128] = {0};
-    auto nowSecond = date.microSecondsSinceEpoch() / MICRO_SECONDS_PRE_SEC;
+    auto nowSecond =
+        date.microSecondsSinceEpoch() / trantor::Date::MICRO_SECONDS_PER_SEC;
     if (nowSecond == lastSecond)
     {
         return lastTimeString;
     }
     lastSecond = nowSecond;
-    date.toCustomFormattedString("%a, %d %b %Y %H:%M:%S GMT",
-                                 lastTimeString,
-                                 sizeof(lastTimeString));
+    formatHttpDate(lastTimeString, sizeof(lastTimeString), date);
+    return lastTimeString;
+}
+
+void dateToCustomFormattedString(const std::string &fmtStr,
+                                 std::string &str,
+                                 const trantor::Date &date)
+{
+    struct tm tm_LValue = date.tmStruct();
+    std::stringstream Out;
+    Out.imbue(std::locale{"C"});
+    Out << std::put_time(&tm_LValue, fmtStr.c_str());
+    str = Out.str();
+}
+
+const std::string &getHttpFullDateStr(const trantor::Date &date)
+{
+    static thread_local int64_t lastSecond = 0;
+    static thread_local std::string lastTimeString;
+    auto nowSecond =
+        date.microSecondsSinceEpoch() / trantor::Date::MICRO_SECONDS_PER_SEC;
+    if (nowSecond == lastSecond)
+    {
+        return lastTimeString;
+    }
+    lastSecond = nowSecond;
+    lastTimeString.resize(128);
+    int n = formatHttpDate(lastTimeString.data(), lastTimeString.size(), date);
+    n = std::clamp(n, 0, static_cast<int>(lastTimeString.size() - 1));
+    lastTimeString.resize(static_cast<size_t>(n));
     return lastTimeString;
 }
 
@@ -1063,7 +1135,7 @@ trantor::Date getHttpDate(const std::string &httpFullDateString)
         if (strptime(httpFullDateString.c_str(), format, &tmptm) != NULL)
         {
             auto epoch = timegm(&tmptm);
-            return trantor::Date(epoch * MICRO_SECONDS_PRE_SEC);
+            return trantor::Date(epoch * trantor::Date::MICRO_SECONDS_PER_SEC);
         }
     }
     LOG_WARN << "invalid datetime format: '" << httpFullDateString << "'";
@@ -1300,7 +1372,7 @@ const size_t fixedRandomNumber = []() {
     utils::secureRandomBytes(&res, sizeof(res));
     return res;
 }();
-}
+}  // namespace internal
 
 }  // namespace utils
 }  // namespace drogon

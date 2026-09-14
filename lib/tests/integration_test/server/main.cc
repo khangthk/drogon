@@ -245,6 +245,25 @@ int main()
             throw std::runtime_error("this should fail");
         });
 
+    app().registerHandler(
+        "/api/v1/keepalive_probe",
+        [](const HttpRequestPtr &req,
+           std::function<void(const HttpResponsePtr &)> &&callback) {
+            auto resp = HttpResponse::newHttpResponse();
+            resp->setBody("alive");
+            callback(resp);
+        });
+
+    app().registerHandler(
+        "/api/v1/close_connection",
+        [](const HttpRequestPtr &req,
+           std::function<void(const HttpResponsePtr &)> &&callback) {
+            auto resp = HttpResponse::newHttpResponse();
+            resp->setBody("closed");
+            resp->setCloseConnection(true);
+            callback(resp);
+        });
+
     app().setDocumentRoot("./");
     app().enableSession(60);
 
@@ -408,8 +427,7 @@ int main()
     app().registerCustomExtensionMime("md", "text/markdown");
     app().setFileTypes({"md", "html", "jpg", "cc", "txt"});
     std::cout << "Date: "
-              << std::string{drogon::utils::getHttpFullDate(
-                     trantor::Date::now())}
+              << drogon::utils::getHttpFullDateStr(trantor::Date::now())
               << std::endl;
 
     app().registerBeginningAdvice(

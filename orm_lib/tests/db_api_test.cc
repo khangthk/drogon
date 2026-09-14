@@ -6,10 +6,25 @@
 using namespace drogon;
 using namespace trantor;
 
+namespace
+{
+const std::string_view makeConstStringView()
+{
+    return "value";
+}
+
+[[maybe_unused]] void bindConstStringViewRvalue(orm::DbClient &client)
+{
+    client.execSqlSync("SELECT $1", makeConstStringView());
+}
+}  // namespace
+
 DROGON_TEST(DbApiTest)
 {
 #if USE_POSTGRESQL
     {
+        CHECK(app().hasDbClient("pg_non_fast"));
+        CHECK(app().hasFastDbClient("pg_fast"));
         auto client = app().getDbClient("pg_non_fast");
         CHECK(client != nullptr);
         client->closeAll();
@@ -28,6 +43,8 @@ DROGON_TEST(DbApiTest)
 
 #if USE_MYSQL
     {
+        CHECK(app().hasDbClient("mysql_non_fast"));
+        CHECK(app().hasFastDbClient("mysql_fast"));
         auto client = app().getDbClient("mysql_non_fast");
         CHECK(client != nullptr);
         client->closeAll();
@@ -46,11 +63,15 @@ DROGON_TEST(DbApiTest)
 
 #if USE_SQLITE3
     {
+        CHECK(app().hasDbClient("sqlite3_non_fast"));
         auto client = app().getDbClient("sqlite3_non_fast");
         CHECK(client != nullptr);
         client->closeAll();
     }
 #endif
+
+    CHECK(!app().hasDbClient("this_client_does_not_exist"));
+    CHECK(!app().hasFastDbClient("this_client_does_not_exist"));
 
     app().getLoop()->runAfter(5, [TEST_CTX]() {});  // wait for some time
 }

@@ -5,6 +5,7 @@ endif(WIN32)
 set(UNITTEST_SOURCES
     unittests/main.cc
     unittests/Base64Test.cc
+    unittests/DrogonTestExpansionTest.cc
     unittests/UrlCodecTest.cc
     unittests/GzipTest.cc
     unittests/HttpViewDataTest.cc
@@ -12,6 +13,7 @@ set(UNITTEST_SOURCES
     unittests/ClassNameTest.cc
     unittests/HttpDateTest.cc
     unittests/HttpHeaderTest.cc
+    unittests/HttpResponseSwapTest.cc
     unittests/MD5Test.cc
     unittests/MsgBufferTest.cc
     unittests/OStringStreamTest.cc
@@ -43,6 +45,8 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "MSVC" AND BUILD_SHARED_LIBS)
 else()
   set(UNITTEST_SOURCES ${UNITTEST_SOURCES} ../src/HttpFileImpl.cc
                        unittests/HttpFileTest.cc
+                       unittests/HttpMethodTest.cc
+                       unittests/HttpRequestForwardCacheBodyTest.cc
                        unittests/WebsocketResponseTest.cc)
 endif()
 
@@ -52,16 +56,19 @@ if (BUILD_CTL)
   set(INTEGRATION_TEST_CLIENT_SOURCES
       integration_test/client/main.cc
       integration_test/client/WebSocketTest.cc
+      integration_test/client/WebSocketKeepAliveUpgradeTest.cc
+      integration_test/client/CloseConnectionTest.cc
       integration_test/client/MultipleWsTest.cc
       integration_test/client/HttpPipeliningTest.cc
+      integration_test/client/ExpectContinueTest.cc
       integration_test/client/RequestStreamTest.cc)
-  add_executable(integration_test_client ${INTEGRATION_TEST_CLIENT_SOURCES})
 
   set(INTEGRATION_TEST_SERVER_SOURCES
       integration_test/server/CustomCtrl.cc
       integration_test/server/CustomHeaderFilter.cc
       integration_test/server/DoNothingPlugin.cc
       integration_test/server/ForwardCtrl.cc
+      integration_test/server/HttpClientOutstandingRequests.cc
       integration_test/server/JsonTestController.cc
       integration_test/server/ListParaCtl.cc
       integration_test/server/PipeliningTest.cc
@@ -84,11 +91,16 @@ if (BUILD_CTL)
     set(INTEGRATION_TEST_SERVER_SOURCES
         ${INTEGRATION_TEST_SERVER_SOURCES}
         integration_test/server/CoroFilter.cpp
-        integration_test/server/api_v1_CoroTest.cc)
+        integration_test/server/api_v1_CoroTest.cc
+        integration_test/server/WebSocketCoroTest.cc)
+    set(INTEGRATION_TEST_CLIENT_SOURCES
+        ${INTEGRATION_TEST_CLIENT_SOURCES}
+        integration_test/client/WebSocketCoroTest.cc)
     set(CMAKE_CXX_STANDARD 20)
     set(CMAKE_CXX_STANDARD_REQUIRED TRUE)
   endif(DROGON_CXX_STANDARD GREATER_EQUAL 20 AND HAS_COROUTINE)
 
+  add_executable(integration_test_client ${INTEGRATION_TEST_CLIENT_SOURCES})
   add_executable(integration_test_server ${INTEGRATION_TEST_SERVER_SOURCES})
   drogon_create_views(integration_test_server
                       ${CMAKE_CURRENT_SOURCE_DIR}/integration_test/server
@@ -137,3 +149,9 @@ set_property(TARGET ${tests} PROPERTY CXX_EXTENSIONS OFF)
 ParseAndAddDrogonTests(unittest)
 ParseAndAddDrogonTests(cookie_same_site)
 ParseAndAddDrogonTests(real_ip_resolver)
+
+add_test(
+  NAME drogon_test_runner_cli
+  COMMAND ${CMAKE_COMMAND}
+          -DTEST_RUNNER=$<TARGET_FILE:unittest>
+          -P ${CMAKE_CURRENT_SOURCE_DIR}/DrogonTestRunnerCliTest.cmake)

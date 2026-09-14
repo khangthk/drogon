@@ -16,6 +16,7 @@
 
 #include "HttpUtils.h"
 #include "CacheFile.h"
+#include "impl_forwards.h"
 #include <drogon/utils/Utilities.h>
 #include <drogon/HttpRequest.h>
 #include <drogon/RequestStream.h>
@@ -26,12 +27,18 @@
 #include <trantor/utils/Logger.h>
 #include <trantor/utils/MsgBuffer.h>
 #include <trantor/utils/NonCopyable.h>
+#include <trantor/net/TcpConnection.h>
 #include <algorithm>
+#include <functional>
+#include <memory>
 #include <string>
-#include <thread>
+#include <future>
 #include <unordered_map>
 #include <assert.h>
 #include <stdio.h>
+
+// Forward declaration so we can befriend a global-namespace test helper.
+class HttpRequestImplCacheFileTestAccess;
 
 namespace drogon
 {
@@ -55,6 +62,7 @@ class HttpRequestImpl : public HttpRequest
 {
   public:
     friend class HttpRequestParser;
+    friend class ::HttpRequestImplCacheFileTestAccess;
 
     explicit HttpRequestImpl(trantor::EventLoop *loop)
         : creationDate_(trantor::Date::now()), loop_(loop)
@@ -97,6 +105,7 @@ class HttpRequestImpl : public HttpRequest
         streamFinishCb_ = nullptr;
         streamExceptionPtr_ = nullptr;
         startProcessing_ = false;
+        connPtr_.reset();
     }
 
     trantor::EventLoop *getLoop()
@@ -326,6 +335,11 @@ class HttpRequestImpl : public HttpRequest
         peerCertificate_ = cert;
     }
 
+    void setConnectionPtr(const std::shared_ptr<trantor::TcpConnection> &ptr)
+    {
+        connPtr_ = ptr;
+    }
+
     void addHeader(const char *start, const char *colon, const char *end);
 
     void removeHeader(std::string key) override
@@ -339,6 +353,11 @@ class HttpRequestImpl : public HttpRequest
     void removeHeaderBy(const std::string &lowerKey)
     {
         headers_.erase(lowerKey);
+    }
+
+    void clearHeaders() override
+    {
+        headers_.clear();
     }
 
     const std::string &getHeader(std::string field) const override
@@ -394,6 +413,27 @@ class HttpRequestImpl : public HttpRequest
 
     void setParameter(const std::string &key, const std::string &value) override
     {
+        flagForParsingParameters_ = true;
+        parameters_[key] = value;
+    }
+
+    void setQueryParameter(const std::string &key,
+                           const std::string &value) override
+    {
+        if (!query_.empty())
+        {
+            query_.append("&");
+        }
+        query_.append(utils::urlEncodeComponent(key));
+        query_.append("=");
+        query_.append(utils::urlEncodeComponent(value));
+    }
+
+    void setBodyParameter(const std::string &key,
+                          const std::string &value) override
+    {
+        assert(contentType_ == CT_MULTIPART_FORM_DATA ||
+               contentType_ == CT_APPLICATION_X_FORM);
         flagForParsingParameters_ = true;
         parameters_[key] = value;
     }
@@ -554,6 +594,21 @@ class HttpRequestImpl : public HttpRequest
         return keepAlive_;
     }
 
+    bool connected() const noexcept override
+    {
+        if (auto conn = connPtr_.lock())
+        {
+            return conn->connected();
+        }
+        return false;
+    }
+
+    const std::weak_ptr<trantor::TcpConnection> &getConnectionPtr()
+        const noexcept override
+    {
+        return connPtr_;
+    }
+
     bool isOnSecureConnection() const noexcept override
     {
         return isOnSecureConnection_;
@@ -705,6 +760,7 @@ class HttpRequestImpl : public HttpRequest
     RequestStreamReaderPtr streamReaderPtr_;
     std::exception_ptr streamExceptionPtr_;
     bool startProcessing_{false};
+    std::weak_ptr<trantor::TcpConnection> connPtr_;
 
   protected:
     std::string content_;

@@ -43,6 +43,16 @@
 #include <vector>
 #include <chrono>
 
+#if defined(__APPLE__) && defined(__MACH__) && \
+    (defined(__ENVIRONMENT_IPHONE_OS__) ||     \
+     defined(__IPHONE_OS_VERSION_MIN_REQUIRED))
+// iOS
+#define TARGET_OS_IOS 1
+#else
+// not iOS
+#define TARGET_OS_IOS 0
+#endif
+
 namespace drogon
 {
 // the drogon banner
@@ -349,7 +359,7 @@ class DROGON_EXPORT HttpAppFramework : public trantor::NonCopyable
 
     /// Register an advice called before routing
     /**
-     * @param advice is called after all the synchronous advices return
+     * @param advice is called after all the synchronous advice return
      * nullptr and before the request is routed to any handler. The parameters
      * of the advice are same as those of the doFilter method of the Filter
      * class.
@@ -997,7 +1007,7 @@ class DROGON_EXPORT HttpAppFramework : public trantor::NonCopyable
     virtual HttpAppFramework &setFileTypes(
         const std::vector<std::string> &types) = 0;
 
-#ifndef _WIN32
+#if !defined(_WIN32) && !TARGET_OS_IOS
     /// Enable supporting for dynamic views loading.
     /**
      *
@@ -1389,6 +1399,22 @@ class DROGON_EXPORT HttpAppFramework : public trantor::NonCopyable
     virtual orm::DbClientPtr getFastDbClient(
         const std::string &name = "default") = 0;
 
+    /// Return true if a database client with the given name has been
+    /// configured
+    /**
+     * @note
+     * This method must be called after the framework has been run.
+     */
+    virtual bool hasDbClient(const std::string &name = "default") const = 0;
+
+    /// Return true if a 'fast' database client with the given name has been
+    /// configured
+    /**
+     * @note
+     * This method must be called after the framework has been run.
+     */
+    virtual bool hasFastDbClient(const std::string &name = "default") const = 0;
+
     /**
      * @brief Check if all database clients in the framework are available
      * (connect to the database successfully).
@@ -1614,6 +1640,15 @@ class DROGON_EXPORT HttpAppFramework : public trantor::NonCopyable
      */
     virtual HttpAppFramework &setAfterAcceptSockOptCallback(
         std::function<void(int)> cb) = 0;
+
+    /**
+     * @brief Set the client disconnect or connect callback.
+     *
+     * @param cb This callback will be called, when the client disconnect or
+     * connect
+     */
+    virtual HttpAppFramework &setConnectionCallback(
+        std::function<void(const trantor::TcpConnectionPtr &)> cb) = 0;
 
     virtual HttpAppFramework &enableRequestStream(bool enable = true) = 0;
     virtual bool isRequestStreamEnabled() const = 0;

@@ -30,6 +30,7 @@
 #include "HttpControllersRouter.h"
 #include "StaticFileRouter.h"
 #include "WebSocketConnectionImpl.h"
+#include "impl_forwards.h"
 
 #if COZ_PROFILING
 #include <coz.h>
@@ -56,6 +57,8 @@ static inline HttpResponsePtr getCompressedResponse(
     const HttpRequestImplPtr &req,
     const HttpResponsePtr &response,
     bool isHeadMethod);
+static inline void applyConnectionDecision(const HttpRequestImplPtr &req,
+                                           HttpResponsePtr &resp);
 
 static void handleInvalidHttpMethod(
     const HttpRequestImplPtr &req,
@@ -75,7 +78,12 @@ HttpServer::HttpServer(EventLoop *loop,
     : server_(loop, listenAddr, std::move(name), true, app().reusePort())
 #endif
 {
-    server_.setConnectionCallback(onConnection);
+    server_.setConnectionCallback(
+        [this](const trantor::TcpConnectionPtr &conn) {
+            onConnection(conn);
+            if (connectionCallback_)
+                connectionCallback_(conn);
+        });
     server_.setRecvMessageCallback(onMessage);
     server_.kickoffIdleConnections(
         HttpAppFrameworkImpl::instance().getIdleConnectionTimeout());
@@ -124,15 +132,20 @@ void HttpServer::onConnection(const TcpConnectionPtr &conn)
     else if (conn->disconnected())
     {
         LOG_TRACE << "conn disconnected!";
-        HttpConnectionLimit::instance().releaseConnection(conn);
         auto requestParser = conn->getContext<HttpRequestParser>();
         if (requestParser)
         {
+            // NOTE: if tls handshake fails, `onConnection()` will only be
+            // called once with a broken conn. So we only call
+            // `releaseConnection()` for conn with context.
+            // Never call `conn->clearContext()` in other places
+            HttpConnectionLimit::instance().releaseConnection(conn);
             if (requestParser->webSocketConn())
             {
                 requestParser->webSocketConn()->onClose();
             }
-            else if (requestParser->requestImpl()->isStreamMode())
+            else if (requestParser->requestImpl()->streamStatus() ==
+                     ReqStreamStatus::Open)
             {
                 requestParser->requestImpl()->streamError(
                     std::make_exception_ptr(
@@ -200,13 +213,9 @@ void HttpServer::onMessage(const TcpConnectionPtr &conn, MsgBuffer *buf)
                     statusCodeToString(code).data()));
             }
             buf->retrieveAll();
-            // NOTE: should we call conn->forceClose() instead?
-            // Calling shutdown() handles socket more elegantly.
+            // stop parser to ignore following illegal data from client
+            requestParser->stop();
             conn->shutdown();
-            // We have to call clearContext() here in order to ignore following
-            // illegal data from client
-            conn->clearContext();
-            requestParser->reset();
             return;
         }
         if (parseRes == 0)
@@ -220,6 +229,7 @@ void HttpServer::onMessage(const TcpConnectionPtr &conn, MsgBuffer *buf)
             req->setCreationDate(trantor::Date::date());
             req->setSecure(conn->isSSLConnection());
             req->setPeerCertificate(conn->peerCertificate());
+            req->setConnectionPtr(conn);
             // TODO: maybe call onRequests() directly in stream mode
             requests.push_back(req);
         }
@@ -270,8 +280,11 @@ void HttpServer::onRequests(
 {
     assert(!requests.empty());
 
-    // will only be checked for the first request
-    if (requestParser->firstReq() && requests.size() == 1 &&
+    // A WebSocket upgrade may arrive after earlier HTTP requests on the same
+    // keep-alive connection. Reverse proxies commonly reuse their upstream
+    // connections, so limiting upgrade detection to the first request causes
+    // valid reconnects to fall through to ordinary HTTP routing.
+    if (requests.size() == 1 && requestParser->emptyPipelining() &&
         isWebSocket(requests[0]))
     {
         auto &req = requests[0];
@@ -306,7 +319,7 @@ void HttpServer::onRequests(
             return;
         }
 
-        // flush response for not passing sync advices
+        // flush response for not passing sync advice
         if (conn->connected() && !requestParser->getResponseBuffer().empty())
         {
             sendResponses(conn,
@@ -569,12 +582,18 @@ void HttpServer::requestPassMiddlewares(const HttpRequestImplPtr &req,
 template <typename Pack>
 void HttpServer::requestPreHandling(const HttpRequestImplPtr &req, Pack &&pack)
 {
+    // Handle CORS preflight request, except when custom handling is desired
     if (req->method() == Options)
     {
-        handleHttpOptions(req,
-                          *pack.binderPtr->corsMethods_,
-                          std::move(pack.callback));
-        return;
+        if (!req->attributes()->get<bool>("drogon.customCORShandling"))
+        {
+            handleHttpOptions(req,
+                              *pack.binderPtr->corsMethods_,
+                              std::move(pack.callback));
+            return;
+        }
+        req->attributes()->insert("drogon.corsMethods",
+                                  *pack.binderPtr->corsMethods_);
     }
 
     // pre-handling aop
@@ -734,8 +753,15 @@ void HttpServer::websocketRequestRouting(
 
     // Not found
     auto resp = drogon::HttpResponse::newNotFoundResponse(req);
-    resp->setCloseConnection(true);
-    callback(resp);
+    // newNotFoundResponse() may hand back a shared custom 404 page or a
+    // per-IO-thread cached response. Mutating it here would mark that shared
+    // object as explicitly close-on-send for every later request that reuses
+    // it, so work on a copy instead.
+    auto respImpl = std::make_shared<HttpResponseImpl>(
+        *static_cast<HttpResponseImpl *>(resp.get()));
+    respImpl->setExpiredTime(-1);  // make it temporary
+    respImpl->setCloseConnection(true);
+    callback(respImpl);
 }
 
 void HttpServer::websocketRequestHandling(
@@ -744,16 +770,20 @@ void HttpServer::websocketRequestHandling(
     std::function<void(const HttpResponsePtr &)> &&callback,
     WebSocketConnectionImplPtr &&wsConnPtr)
 {
-    binderPtr->handleRequest(
-        req,
-        [req, callback = std::move(callback)](const HttpResponsePtr &resp) {
-            AopAdvice::instance().passPostHandlingAdvices(req, resp);
+    auto request = req;
+    auto binder = std::move(binderPtr);
+    auto wsConn = std::move(wsConnPtr);
+
+    binder->handleRequest(
+        request,
+        [request, callback = std::move(callback)](const HttpResponsePtr &resp) {
+            AopAdvice::instance().passPostHandlingAdvices(request, resp);
             callback(resp);
         });
 
     // TODO: more elegant?
-    static_cast<WebsocketControllerBinder *>(binderPtr.get())
-        ->handleNewConnection(req, wsConnPtr);
+    static_cast<WebsocketControllerBinder *>(binder.get())
+        ->handleNewConnection(request, wsConn);
 }
 
 void HttpServer::handleResponse(
@@ -782,8 +812,7 @@ void HttpServer::handleResponse(
     auto resp =
         HttpAppFrameworkImpl::instance().handleSessionForResponse(req,
                                                                   response);
-    resp->setVersion(req->getVersion());
-    resp->setCloseConnection(!req->keepAlive());
+    applyConnectionDecision(req, resp);
     AopAdvice::instance().passPreSendingAdvices(req, resp);
 
     auto newResp = getCompressedResponse(req, resp, isHeadMethod);
@@ -971,7 +1000,7 @@ void HttpServer::sendResponse(const TcpConnectionPtr &conn,
         auto &asyncStreamCallback = respImplPtr->asyncStreamCallback();
         if (asyncStreamCallback)
         {
-            if (!respImplPtr->ifCloseConnection())
+            if (respImplPtr->version() != Version::kHttp10)
             {
                 asyncStreamCallback(
                     std::make_unique<ResponseStream>(conn->sendAsyncStream(
@@ -979,7 +1008,7 @@ void HttpServer::sendResponse(const TcpConnectionPtr &conn,
             }
             else
             {
-                LOG_INFO << "Chunking Set CloseConnection !!!";
+                LOG_INFO << "Async stream not supported for HTTP/1.0";
             }
         }
         auto &streamCallback = respImplPtr->streamCallback();
@@ -1055,7 +1084,7 @@ void HttpServer::sendResponses(
             {
                 conn->send(buffer);
                 buffer.retrieveAll();
-                if (!respImplPtr->ifCloseConnection())
+                if (respImplPtr->version() != Version::kHttp10)
                 {
                     asyncStreamCallback(
                         std::make_unique<ResponseStream>(conn->sendAsyncStream(
@@ -1063,7 +1092,7 @@ void HttpServer::sendResponses(
                 }
                 else
                 {
-                    LOG_INFO << "Chunking Set CloseConnection !!!";
+                    LOG_INFO << "Async stream not supported for HTTP/1.0";
                 }
             }
             auto &streamCallback = respImplPtr->streamCallback();
@@ -1195,7 +1224,7 @@ static inline HttpResponsePtr tryDecompressRequest(
  * @brief Check request against each sync advice, generate response if request
  * is rejected by any one of them.
  *
- * @return true if all sync advices are passed.
+ * @return true if all sync advice are passed.
  * @return false if rejected by any sync advice.
  */
 static inline bool passSyncAdvices(
@@ -1207,8 +1236,7 @@ static inline bool passSyncAdvices(
     if (auto resp = AopAdvice::instance().passSyncAdvices(req))
     {
         // Rejected by sync advice
-        resp->setVersion(req->getVersion());
-        resp->setCloseConnection(!req->keepAlive());
+        applyConnectionDecision(req, resp);
         if (!shouldBePipelined)
         {
             requestParser->getResponseBuffer().emplace_back(
@@ -1222,6 +1250,43 @@ static inline bool passSyncAdvices(
         return false;
     }
     return true;
+}
+
+/**
+ * @brief Stamp this request's version and connection decision onto `resp`,
+ * replacing it with a private copy first when it is a shared cached response.
+ *
+ * Responses with an expired time are handed out by the framework's caches (the
+ * custom 404 page, app().cacheResponse(), ...) and are reused across requests.
+ * Deciding keep-alive by mutating such an object leaks one request's decision
+ * into every later request served from the same object, and races with the
+ * other IO threads sharing it. So take a copy whenever this request needs
+ * different framing from what the cached object already carries.
+ *
+ * Application-set closeConnection is respected: only the framework's own
+ * default is overridden. That distinction is made through
+ * closeConnectionSetByUser() rather than ifCloseConnection() because
+ * setVersion() also sets the flag as a side effect for HTTP/1.0.
+ */
+static inline void applyConnectionDecision(const HttpRequestImplPtr &req,
+                                           HttpResponsePtr &resp)
+{
+    auto implPtr = static_cast<HttpResponseImpl *>(resp.get());
+    const bool closeConnection = implPtr->closeConnectionSetByUser()
+                                     ? implPtr->ifCloseConnection()
+                                     : !req->keepAlive();
+    if (implPtr->expiredTime() >= 0 &&
+        (implPtr->version() != req->getVersion() ||
+         implPtr->ifCloseConnection() != closeConnection))
+    {
+        auto newResp = std::make_shared<HttpResponseImpl>(*implPtr);
+        newResp->setExpiredTime(-1);  // make it temporary
+        resp = newResp;
+        implPtr = newResp.get();
+    }
+    implPtr->setVersion(req->getVersion());
+    if (!implPtr->closeConnectionSetByUser())
+        implPtr->setCloseConnectionInternal(!req->keepAlive());
 }
 
 static inline HttpResponsePtr getCompressedResponse(
